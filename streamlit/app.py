@@ -7,6 +7,7 @@
 import io
 import time
 import warnings
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -59,7 +60,13 @@ st.markdown("""
 # ─────────────────────────────────────────────
 # SESSION STATE
 # ─────────────────────────────────────────────
-for key, default in [("datasets", {}), ("results_df", None), ("summary_df", None)]:
+for key, default in [
+    ("datasets", {}),
+    ("results_df", None),
+    ("summary_df", None),
+    ("auto_loaded_files", []),
+    ("autoload_done", False),
+]:
     if key not in st.session_state:
         st.session_state[key] = default
 
@@ -124,6 +131,88 @@ def read_uploaded_file(uploaded) -> pd.DataFrame | None:
     st.error(f"Format tidak didukung: {name}")
     return None
 
+
+
+
+def get_data_dir() -> Path:
+    """Folder data permanen. Default: folder data di sebelah app.py."""
+    try:
+        base_dir = Path(__file__).resolve().parent
+    except NameError:
+        base_dir = Path.cwd()
+    return base_dir / "data"
+
+
+def read_local_file(path: Path) -> pd.DataFrame | None:
+    """Baca dataset dari file lokal di folder data/."""
+    suffix = path.suffix.lower()
+    raw = path.read_bytes()
+
+    if suffix == ".arff":
+        return read_arff_bytes(raw)
+
+    if suffix == ".csv":
+        for sep in [None, ",", ";", "\t"]:
+            try:
+                return pd.read_csv(io.BytesIO(raw), sep=sep, engine="python")
+            except Exception:
+                continue
+        raise ValueError("CSV tidak bisa dibaca. Cek delimiter atau encoding file.")
+
+    if suffix in [".xlsx", ".xls"]:
+        return pd.read_excel(io.BytesIO(raw))
+
+    return None
+
+
+def load_datasets_from_data_folder(force: bool = False):
+    """Auto-load semua dataset dari folder data/.
+
+    Urutan kerja:
+    1. Cek folder data/ di lokasi yang sama dengan app.py.
+    2. Baca semua file .arff, .csv, .xlsx, .xls.
+    3. Nama dataset dideteksi otomatis dari nama file.
+    4. Dataset masuk ke st.session_state.datasets.
+    """
+    if st.session_state.get("autoload_done") and not force:
+        return st.session_state.get("auto_loaded_files", [])
+
+    data_dir = get_data_dir()
+    loaded_files = []
+
+    if not data_dir.exists():
+        st.session_state.auto_loaded_files = []
+        st.session_state.autoload_done = True
+        return []
+
+    supported_ext = {".arff", ".csv", ".xlsx", ".xls"}
+    files = sorted([p for p in data_dir.iterdir() if p.is_file() and p.suffix.lower() in supported_ext])
+
+    for path in files:
+        try:
+            df = read_local_file(path)
+            if df is not None and not df.empty:
+                ds_name = infer_dataset_name(path.name, st.session_state.datasets.keys())
+                st.session_state.datasets[ds_name] = df
+                loaded_files.append({
+                    "Dataset": ds_name,
+                    "File": path.name,
+                    "Baris": int(df.shape[0]),
+                    "Kolom": int(df.shape[1]),
+                    "Status": "Auto-loaded dari folder data",
+                })
+        except Exception as e:
+            loaded_files.append({
+                "Dataset": "-",
+                "File": path.name,
+                "Baris": 0,
+                "Kolom": 0,
+                "Status": f"Gagal dibaca: {e}",
+            })
+
+    st.session_state.auto_loaded_files = loaded_files
+    st.session_state.autoload_done = True
+    return loaded_files
 
 def infer_dataset_name(filename: str, existing_names=None) -> str:
     """Ambil nama dataset otomatis dari nama file: JM1, KC1, PC1, CM1, KC3, dst."""
@@ -387,6 +476,13 @@ def to_excel_bytes(results_df: pd.DataFrame, summary_df: pd.DataFrame | None = N
 
 
 # ─────────────────────────────────────────────
+# AUTO LOAD DATASET DARI FOLDER data/
+# ─────────────────────────────────────────────
+# Dataset di streamlit/data/ akan otomatis dibaca saat app pertama kali dibuka.
+load_datasets_from_data_folder(force=False)
+
+
+# ─────────────────────────────────────────────
 # SIDEBAR NAVIGATION
 # ─────────────────────────────────────────────
 st.sidebar.markdown("## 🔬 Software Defect Prediction")
@@ -405,6 +501,7 @@ n_res = len(st.session_state.results_df) if st.session_state.results_df is not N
 st.sidebar.markdown("---")
 st.sidebar.markdown(f"**Dataset loaded:** {n_ds}")
 st.sidebar.markdown(f"**Hasil eksperimen:** {n_res} skenario")
+st.sidebar.caption(f"Data folder: `{get_data_dir()}`")
 
 
 # ══════════════════════════════════════════════════════════
@@ -475,7 +572,7 @@ Evaluasi menekankan **F1-score, Recall, AUC, dan MCC** karena dataset tidak seim
     st.markdown("---")
     st.markdown('<div class="sec-header">🚀 Cara Menggunakan</div>', unsafe_allow_html=True)
     s1, s2, s3, s4 = st.columns(4)
-    s1.markdown("**1️⃣ Upload Dataset**\nBuka 📂 Dataset dan upload satu/banyak file `.arff`, `.csv`, atau `.xlsx` sekaligus.")
+    s1.markdown("**1️⃣ Dataset**\nSimpan file di folder `data/` agar auto-load, atau upload manual di 📂 Dataset.")
     s2.markdown("**2️⃣ Konfigurasi**\nBuka ⚙️ Eksperimen, pilih metode FS, nilai k, dan algoritma yang ingin diuji.")
     s3.markdown("**3️⃣ Jalankan**\nKlik tombol **Mulai Eksperimen** dan tunggu proses selesai.")
     s4.markdown("**4️⃣ Analisis**\nLihat hasil lengkap di 📊 Hasil & Analisis, dan download Excel.")
@@ -487,11 +584,43 @@ Evaluasi menekankan **F1-score, Recall, AUC, dan MCC** karena dataset tidak seim
 elif page == "📂 Dataset":
     st.markdown('<div class="main-title">📂 Manajemen Dataset</div>', unsafe_allow_html=True)
 
-    st.markdown('<div class="sec-header">Upload Dataset</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sec-header">Dataset Otomatis dari Folder data/</div>', unsafe_allow_html=True)
     st.markdown(
-        '<div class="info-box">Upload file <b>.arff</b>, <b>.csv</b>, atau <b>.xlsx</b>. '
-        'Sekarang cukup upload banyak file sekaligus; nama dataset akan dideteksi otomatis dari nama file, '
-        'misalnya <b>JM1.arff</b>, <b>KC1.arff</b>, <b>PC1.arff</b>, <b>CM1.arff</b>, atau <b>KC3.arff</b>.</div>',
+        '<div class="info-box">Jika tidak ingin upload dataset terus, simpan file dataset di folder '
+        '<b>data/</b> yang sejajar dengan <b>app.py</b>. Saat app dibuka, file <b>.arff</b>, '
+        '<b>.csv</b>, <b>.xlsx</b>, atau <b>.xls</b> akan otomatis dibaca dulu.</div>',
+        unsafe_allow_html=True,
+    )
+
+    data_dir = get_data_dir()
+    if st.session_state.auto_loaded_files:
+        st.success(f"✅ Dataset dari folder data sudah dicek: {data_dir}")
+        st.dataframe(pd.DataFrame(st.session_state.auto_loaded_files), hide_index=True, use_container_width=True)
+    else:
+        st.info(f"Folder data yang dicek: `{data_dir}`. Jika belum ada, buat folder `data/` lalu masukkan dataset di sana.")
+
+    c_load1, c_load2 = st.columns([1, 1])
+    with c_load1:
+        if st.button("🔄 Muat ulang dari folder data", use_container_width=True):
+            st.session_state.autoload_done = False
+            load_datasets_from_data_folder(force=True)
+            st.session_state.results_df = None
+            st.session_state.summary_df = None
+            st.rerun()
+    with c_load2:
+        if st.button("🧹 Reset Dataset", use_container_width=True):
+            st.session_state.datasets = {}
+            st.session_state.results_df = None
+            st.session_state.summary_df = None
+            st.session_state.auto_loaded_files = []
+            st.session_state.autoload_done = True
+            st.rerun()
+
+    st.markdown("---")
+    st.markdown('<div class="sec-header">Upload Dataset Manual</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="info-box">Bagian ini opsional. Upload manual dipakai jika ingin menambah dataset baru '
+        'atau mengganti dataset dari folder <b>data/</b> tanpa mengubah file project.</div>',
         unsafe_allow_html=True,
     )
     st.markdown("")
@@ -502,14 +631,6 @@ elif page == "📂 Dataset":
         accept_multiple_files=True,
         help="Bisa upload satu file atau banyak file dataset sekaligus.",
     )
-
-    c_up1, c_up2 = st.columns([1, 4])
-    with c_up1:
-        if st.button("🧹 Reset Dataset", use_container_width=True):
-            st.session_state.datasets = {}
-            st.session_state.results_df = None
-            st.session_state.summary_df = None
-            st.rerun()
 
     if up_files:
         loaded_rows = []
@@ -548,7 +669,7 @@ elif page == "📂 Dataset":
         st.dataframe(active_df, hide_index=True, use_container_width=True)
 
     if not st.session_state.datasets:
-        st.warning("⚠️ Belum ada dataset. Upload minimal satu dataset untuk melanjutkan.")
+        st.warning("⚠️ Belum ada dataset. Simpan file di folder data/ atau upload manual minimal satu dataset untuk melanjutkan.")
         st.stop()
 
     # ── Dataset Summary ────────────────────────────────────
