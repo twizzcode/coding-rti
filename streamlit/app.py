@@ -543,6 +543,8 @@ if run_button:
 
         class_dist = pd.Series(y).value_counts().to_dict()
 
+        defect_ratio = class_dist.get(1, 0) / X.shape[0] if X.shape[0] > 0 else np.nan
+
         dataset_summary.append({
             "dataset": dataset_name,
             "target_column": target_col,
@@ -550,8 +552,15 @@ if run_button:
             "num_features": X.shape[1],
             "class_0": class_dist.get(0, 0),
             "class_1": class_dist.get(1, 0),
-            "defect_ratio": class_dist.get(1, 0) / X.shape[0],
+            "defect_ratio": defect_ratio,
         })
+
+        if X.shape[0] == 0:
+            st.warning(
+                f"Dataset {dataset_name} dilewati karena setelah preprocessing jumlah data menjadi 0. "
+                "Cek kolom target, format label, atau isi dataset."
+            )
+            continue
 
         if len(np.unique(y)) < 2:
             st.warning(f"Dataset {dataset_name} dilewati karena hanya memiliki satu kelas.")
