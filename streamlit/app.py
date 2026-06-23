@@ -69,94 +69,228 @@ for key, default in [("datasets", {}), ("results_df", None), ("summary_df", None
 # ─────────────────────────────────────────────
 
 def read_arff_bytes(file_bytes: bytes) -> pd.DataFrame:
-    """Parse ARFF from raw bytes."""
-    content = file_bytes.decode("utf-8", errors="replace")
-    data, _ = arff_io.loadarff(io.StringIO(content))
-    df = pd.DataFrame(data)
+    """Parse ARFF dari raw bytes dengan fallback encoding."""
+    last_err = None
+    for enc in ("utf-8", "latin-1", "cp1252"):
+        try:
+            content = file_bytes.decode(enc)
+            data, _ = arff_io.loadarff(io.StringIO(content))
+            df = pd.DataFrame(data)
+            return decode_bytes_dataframe(df)
+        except Exception as e:
+            last_err = e
+
+    # fallback terakhir: tetap coba baca dengan karakter rusak diganti
+    try:
+        content = file_bytes.decode("utf-8", errors="replace")
+        data, _ = arff_io.loadarff(io.StringIO(content))
+        df = pd.DataFrame(data)
+        return decode_bytes_dataframe(df)
+    except Exception:
+        raise last_err
+
+
+def decode_bytes_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """Ubah value bytes dari ARFF menjadi string biasa."""
+    df = df.copy()
     for col in df.columns:
         if df[col].dtype == object:
             df[col] = df[col].apply(
-                lambda x: x.decode("utf-8") if isinstance(x, bytes) else x
+                lambda x: x.decode("utf-8", errors="replace") if isinstance(x, bytes) else x
             )
     return df
 
 
 def read_uploaded_file(uploaded) -> pd.DataFrame | None:
-    """Dispatch reader based on file extension."""
+    """Reader fleksibel untuk .arff, .csv, .xlsx, .xls."""
     name = uploaded.name.lower()
-    raw = uploaded.read()
+    raw = uploaded.getvalue() if hasattr(uploaded, "getvalue") else uploaded.read()
+
     if name.endswith(".csv"):
-        return pd.read_csv(io.BytesIO(raw))
-    elif name.endswith((".xlsx", ".xls")):
+        # Coba beberapa separator umum agar file CSV dari Excel juga aman
+        for sep in [None, ",", ";", "\t"]:
+            try:
+                return pd.read_csv(io.BytesIO(raw), sep=sep, engine="python")
+            except Exception:
+                continue
+        raise ValueError("CSV tidak bisa dibaca. Cek delimiter atau encoding file.")
+
+    if name.endswith((".xlsx", ".xls")):
         return pd.read_excel(io.BytesIO(raw))
-    elif name.endswith(".arff"):
+
+    if name.endswith(".arff"):
         return read_arff_bytes(raw)
-    else:
-        st.error(f"Format tidak didukung: {name}")
-        return None
+
+    st.error(f"Format tidak didukung: {name}")
+    return None
+
+
+def infer_dataset_name(filename: str, existing_names=None) -> str:
+    """Ambil nama dataset otomatis dari nama file: JM1, KC1, PC1, CM1, KC3, dst."""
+    existing_names = set(existing_names or [])
+    stem = filename.rsplit(".", 1)[0].strip()
+    normalized = stem.upper().replace(" ", "_")
+
+    # Pola NASA MDP yang umum, termasuk nama seperti JM1(1).arff
+    for key in ["JM1", "KC1", "PC1", "CM1", "KC3"]:
+        if key in normalized:
+            return key
+
+    # Kalau bukan dataset NASA yang dikenali, pakai nama file tanpa ekstensi
+    name = stem if stem else "Dataset"
+    base = name
+    i = 2
+    while name in existing_names:
+        name = f"{base}_{i}"
+        i += 1
+    return name
 
 
 def detect_target_column(df: pd.DataFrame) -> str:
-    candidates = ["defects", "Defective", "defective", "bug", "bugs",
-                  "class", "Class", "target", "Target", "label", "Label"]
-    for c in candidates:
-        if c in df.columns:
+    """Deteksi kolom target secara fleksibel."""
+    cols = list(df.columns)
+    lower_map = {str(c).strip().lower(): c for c in cols}
+
+    priority = [
+        "defective", "defects", "defect", "bug", "bugs", "fault", "faults",
+        "label", "class", "target", "y", "is_defective", "is_buggy",
+    ]
+    for key in priority:
+        if key in lower_map:
+            return lower_map[key]
+
+    # Jika ada nama kolom yang mengandung defect/bug/fault, gunakan itu
+    for c in cols:
+        cl = str(c).strip().lower()
+        if any(token in cl for token in ["defect", "bug", "fault", "label", "class", "target"]):
             return c
-    return df.columns[-1]
+
+    # Fallback: kolom terakhir
+    return cols[-1]
+
+
+def normalize_target(y: pd.Series) -> pd.Series:
+    """Normalisasi target menjadi 0 = non-defect, 1 = defect."""
+    y = y.apply(lambda x: x.decode("utf-8", errors="replace") if isinstance(x, bytes) else x)
+
+    # Target string/kategori/bool seperti Y/N, true/false, defective/non-defective
+    if y.dtype == object or str(y.dtype) == "category" or y.dtype == bool:
+        ys = y.astype(str).str.strip().str.lower()
+        ys = ys.replace({"nan": np.nan, "none": np.nan, "?": np.nan, "": np.nan})
+
+        mapping = {
+            "y": 1, "yes": 1, "true": 1, "t": 1, "1": 1, "defect": 1,
+            "defects": 1, "defective": 1, "bug": 1, "buggy": 1, "fault": 1,
+            "faulty": 1, "error": 1, "erroneous": 1,
+            "n": 0, "no": 0, "false": 0, "f": 0, "0": 0, "non-defect": 0,
+            "non_defect": 0, "nondefect": 0, "not defective": 0, "clean": 0,
+            "not_buggy": 0, "not buggy": 0, "not faulty": 0,
+        }
+
+        mapped = ys.map(mapping)
+        if mapped.notna().sum() > 0 and mapped.isna().sum() == ys.isna().sum():
+            return mapped
+
+        # Fallback binary string: urutkan label, lalu label kedua dianggap 1
+        non_null = ys.dropna()
+        uniq = sorted(non_null.unique().tolist())
+        if len(uniq) == 2:
+            enc_map = {uniq[0]: 0, uniq[1]: 1}
+            return ys.map(enc_map)
+
+        # Fallback multi-class string: LabelEncoder, lalu >0 dianggap defect
+        le = LabelEncoder()
+        encoded = pd.Series(np.nan, index=ys.index, dtype="float")
+        mask = ys.notna()
+        encoded.loc[mask] = le.fit_transform(ys.loc[mask]).astype(float)
+        return (encoded > 0).astype(float).where(mask, np.nan)
+
+    # Target numerik: nilai > 0 dianggap defect, 0 dianggap non-defect
+    yn = pd.to_numeric(y, errors="coerce")
+    return (yn > 0).astype(float).where(yn.notna(), np.nan)
 
 
 def preprocess_dataset(df: pd.DataFrame):
+    """Preprocessing aman untuk dataset NASA MDP dan dataset upload umum."""
+    if df is None or df.empty:
+        raise ValueError("Dataset kosong atau tidak terbaca.")
+
     df = df.copy()
     df.columns = df.columns.astype(str).str.strip()
+    df = df.loc[:, ~df.columns.duplicated()]
+
+    if df.shape[1] < 2:
+        raise ValueError("Dataset harus memiliki minimal 1 fitur dan 1 target.")
+
     target_col = detect_target_column(df)
 
-    for drop_c in ["id", "ID", "name", "Name", "module", "Module"]:
+    # Drop kolom identitas/non-metrik jika ada
+    drop_candidates = ["id", "ID", "name", "Name", "module", "Module", "version", "Version"]
+    for drop_c in drop_candidates:
         if drop_c in df.columns and drop_c != target_col:
             df.drop(columns=[drop_c], inplace=True)
 
-    y = df[target_col].apply(
-        lambda x: x.decode("utf-8") if isinstance(x, bytes) else x
-    )
-
-    if y.dtype == "object" or str(y.dtype) == "category" or y.dtype == bool:
-        y = y.astype(str).str.strip().str.lower()
-        mapping = {
-            "true": 1, "false": 0, "yes": 1, "no": 0, "y": 1, "n": 0,
-            "defect": 1, "defective": 1, "buggy": 1, "faulty": 1,
-            "non-defect": 0, "non_defect": 0, "clean": 0,
-            "not_buggy": 0, "not faulty": 0, "0": 0, "1": 1,
-        }
-        if set(y.unique()).issubset(set(mapping.keys())):
-            y = y.map(mapping)
-        else:
-            le = LabelEncoder()
-            y = pd.Series(le.fit_transform(y), index=y.index)
-    else:
-        y = y.astype(int)
+    y = normalize_target(df[target_col])
 
     X = df.drop(columns=[target_col])
+    X = decode_bytes_dataframe(X)
+
+    # Ubah fitur kategorikal menjadi numerik ringan, bukan langsung dibuang semua
     for col in X.columns:
-        if X[col].dtype == object:
-            X[col] = X[col].apply(
-                lambda x: x.decode("utf-8") if isinstance(x, bytes) else x
-            )
+        if X[col].dtype == object or str(X[col].dtype) == "category":
+            num = pd.to_numeric(X[col], errors="coerce")
+            # Kalau mayoritas bisa jadi numerik, pakai numerik; sisanya di-encode
+            if num.notna().mean() >= 0.8:
+                X[col] = num
+            else:
+                X[col] = LabelEncoder().fit_transform(X[col].astype(str))
 
     X = X.apply(pd.to_numeric, errors="coerce")
-    X = X.dropna(axis=1, how="all")
     X = X.replace([np.inf, -np.inf], np.nan)
-    X = X.fillna(X.median())
+    X = X.dropna(axis=1, how="all")
 
-    valid = pd.Series(y).notna()
-    X = X.loc[valid]
-    y = pd.Series(y).loc[valid].astype(int).values
+    if X.shape[1] == 0:
+        raise ValueError("Tidak ada fitur numerik yang bisa digunakan setelah preprocessing.")
+
+    # Buang baris target kosong, lalu isi missing value fitur dengan median
+    valid = y.notna()
+    X = X.loc[valid].copy()
+    y = y.loc[valid].astype(int).to_numpy()
+
+    if X.shape[0] == 0:
+        raise ValueError("Tidak ada baris valid setelah target kosong dibuang.")
+
+    med = X.median(numeric_only=True)
+    X = X.fillna(med).fillna(0)
+
+    # Buang fitur konstan karena tidak membantu FS/model
+    nunique = X.nunique(dropna=False)
+    X = X.loc[:, nunique > 1]
+
+    if X.shape[1] == 0:
+        raise ValueError("Semua fitur konstan setelah preprocessing.")
+
+    if len(np.unique(y)) < 2:
+        raise ValueError("Target hanya memiliki 1 kelas unik setelah preprocessing.")
+
     return X, y, target_col
 
 
+def safe_defect_ratio(defect_count: int, total_count: int) -> str:
+    if total_count <= 0:
+        return "0.00%"
+    return f"{defect_count / total_count * 100:.2f}%"
+
+
 def apply_feature_selection(method, X_train, y_train, X_test, k=None):
+    if X_train.shape[1] == 0:
+        raise ValueError("Tidak ada fitur yang tersedia untuk feature selection.")
+
     if method == "none":
         return X_train.values, X_test.values, list(X_train.columns)
 
-    k = min(k, X_train.shape[1])
+    k = int(k or X_train.shape[1])
+    k = max(1, min(k, X_train.shape[1]))
 
     if method == "chi2":
         sc = MinMaxScaler()
@@ -341,7 +475,7 @@ Evaluasi menekankan **F1-score, Recall, AUC, dan MCC** karena dataset tidak seim
     st.markdown("---")
     st.markdown('<div class="sec-header">🚀 Cara Menggunakan</div>', unsafe_allow_html=True)
     s1, s2, s3, s4 = st.columns(4)
-    s1.markdown("**1️⃣ Upload Dataset**\nBuka 📂 Dataset dan upload file `.arff` / `.csv` untuk tiap dataset NASA MDP.")
+    s1.markdown("**1️⃣ Upload Dataset**\nBuka 📂 Dataset dan upload satu/banyak file `.arff`, `.csv`, atau `.xlsx` sekaligus.")
     s2.markdown("**2️⃣ Konfigurasi**\nBuka ⚙️ Eksperimen, pilih metode FS, nilai k, dan algoritma yang ingin diuji.")
     s3.markdown("**3️⃣ Jalankan**\nKlik tombol **Mulai Eksperimen** dan tunggu proses selesai.")
     s4.markdown("**4️⃣ Analisis**\nLihat hasil lengkap di 📊 Hasil & Analisis, dan download Excel.")
@@ -353,34 +487,65 @@ Evaluasi menekankan **F1-score, Recall, AUC, dan MCC** karena dataset tidak seim
 elif page == "📂 Dataset":
     st.markdown('<div class="main-title">📂 Manajemen Dataset</div>', unsafe_allow_html=True)
 
-    DATASET_NAMES = ["JM1", "KC1", "PC1", "CM1", "KC3"]
-
     st.markdown('<div class="sec-header">Upload Dataset</div>', unsafe_allow_html=True)
     st.markdown(
-        '<div class="info-box">Upload file <b>.arff</b>, <b>.csv</b>, atau <b>.xlsx</b> '
-        'untuk setiap dataset NASA MDP. Bisa upload sebagian atau semua.</div>',
+        '<div class="info-box">Upload file <b>.arff</b>, <b>.csv</b>, atau <b>.xlsx</b>. '
+        'Sekarang cukup upload banyak file sekaligus; nama dataset akan dideteksi otomatis dari nama file, '
+        'misalnya <b>JM1.arff</b>, <b>KC1.arff</b>, <b>PC1.arff</b>, <b>CM1.arff</b>, atau <b>KC3.arff</b>.</div>',
         unsafe_allow_html=True,
     )
     st.markdown("")
 
-    cols = st.columns(5)
-    for i, dsn in enumerate(DATASET_NAMES):
-        with cols[i]:
-            up = st.file_uploader(
-                f"**{dsn}**", type=["arff", "csv", "xlsx", "xls"],
-                key=f"up_{dsn}", label_visibility="visible",
-            )
-            if up:
-                try:
-                    df = read_uploaded_file(up)
-                    if df is not None:
-                        st.session_state.datasets[dsn] = df
-                        st.success(f"✅ {df.shape[0]:,} baris\n{df.shape[1]} kolom")
-                except Exception as e:
-                    st.error(f"❌ {e}")
-            elif dsn in st.session_state.datasets:
-                d = st.session_state.datasets[dsn]
-                st.info(f"✅ Loaded\n{d.shape[0]:,} × {d.shape[1]}")
+    up_files = st.file_uploader(
+        "Upload dataset sekaligus",
+        type=["arff", "csv", "xlsx", "xls"],
+        accept_multiple_files=True,
+        help="Bisa upload satu file atau banyak file dataset sekaligus.",
+    )
+
+    c_up1, c_up2 = st.columns([1, 4])
+    with c_up1:
+        if st.button("🧹 Reset Dataset", use_container_width=True):
+            st.session_state.datasets = {}
+            st.session_state.results_df = None
+            st.session_state.summary_df = None
+            st.rerun()
+
+    if up_files:
+        loaded_rows = []
+        for up in up_files:
+            try:
+                df = read_uploaded_file(up)
+                if df is not None:
+                    ds_name = infer_dataset_name(up.name, st.session_state.datasets.keys())
+                    st.session_state.datasets[ds_name] = df
+                    loaded_rows.append({
+                        "Dataset": ds_name,
+                        "File": up.name,
+                        "Baris": df.shape[0],
+                        "Kolom": df.shape[1],
+                        "Status": "Berhasil dibaca",
+                    })
+            except Exception as e:
+                loaded_rows.append({
+                    "Dataset": "-",
+                    "File": up.name,
+                    "Baris": 0,
+                    "Kolom": 0,
+                    "Status": f"Gagal: {e}",
+                })
+
+        if loaded_rows:
+            st.markdown("**Status upload:**")
+            st.dataframe(pd.DataFrame(loaded_rows), hide_index=True, use_container_width=True)
+
+    if st.session_state.datasets:
+        st.markdown("**Dataset yang sedang aktif:**")
+        active_df = pd.DataFrame([
+            {"Dataset": name, "Jumlah Baris": df.shape[0], "Jumlah Kolom": df.shape[1]}
+            for name, df in st.session_state.datasets.items()
+        ])
+        st.dataframe(active_df, hide_index=True, use_container_width=True)
 
     if not st.session_state.datasets:
         st.warning("⚠️ Belum ada dataset. Upload minimal satu dataset untuk melanjutkan.")
@@ -401,7 +566,7 @@ elif page == "📂 Dataset":
             summary_rows.append({
                 "Dataset": dsn, "Jumlah Data": X.shape[0],
                 "Jumlah Fitur": X.shape[1], "Non-Defect": nd,
-                "Defect": d, "Defect Ratio (%)": f"{d / X.shape[0] * 100:.2f}%",
+                "Defect": d, "Defect Ratio (%)": safe_defect_ratio(d, X.shape[0]),
             })
         except Exception as e:
             st.error(f"Error saat preprocessing {dsn}: {e}")
@@ -441,7 +606,7 @@ elif page == "📂 Dataset":
         for bar, v in zip(bars, ratios):
             ax2.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
                      f"{v:.2f}%", ha="center", va="bottom", fontweight="bold", fontsize=10)
-        ax2.set_ylim(0, max(ratios) * 1.3)
+        ax2.set_ylim(0, max(max(ratios) * 1.3, 1))
         ax2.grid(axis="y", alpha=0.3)
         plt.tight_layout()
         st.pyplot(fig2)
@@ -450,6 +615,10 @@ elif page == "📂 Dataset":
     # ── Individual Exploration ─────────────────────────────
     st.markdown("---")
     st.markdown('<div class="sec-header">🔍 Eksplorasi Dataset Individual</div>', unsafe_allow_html=True)
+    if not processed:
+        st.warning("Tidak ada dataset valid yang bisa dieksplorasi. Cek kolom target dan isi dataset.")
+        st.stop()
+
     sel_ds = st.selectbox("Pilih Dataset:", list(processed.keys()))
     if sel_ds:
         X_e, y_e, tc_e = processed[sel_ds]
@@ -620,13 +789,26 @@ elif page == "⚙️ Eksperimen":
                 push_log(f"[ERROR] {dsn}: {e}")
                 continue
 
-            if len(np.unique(y)) < 2:
-                push_log(f"[SKIP] {dsn}: hanya 1 kelas unik.")
+            if X.shape[0] == 0:
+                push_log(f"[SKIP] {dsn}: data kosong setelah preprocessing.")
                 continue
 
-            X_tr, X_te, y_tr, y_te = train_test_split(
-                X, y, test_size=test_size, random_state=42, stratify=y
-            )
+            class_counts = pd.Series(y).value_counts().to_dict()
+            if len(class_counts) < 2:
+                push_log(f"[SKIP] {dsn}: hanya 1 kelas unik setelah preprocessing.")
+                continue
+            if min(class_counts.values()) < 2:
+                push_log(f"[SKIP] {dsn}: jumlah sampel pada salah satu kelas kurang dari 2, tidak aman untuk stratified split.")
+                continue
+
+            try:
+                X_tr, X_te, y_tr, y_te = train_test_split(
+                    X, y, test_size=test_size, random_state=42, stratify=y
+                )
+            except Exception as e:
+                push_log(f"[SPLIT-ERR] {dsn}: {e}")
+                continue
+
             push_log(f"\n{'='*60}")
             push_log(f"[DATASET] {dsn} | {X.shape[0]} data | {X.shape[1]} fitur | "
                      f"Defect: {y.sum()} ({y.mean()*100:.1f}%)")
