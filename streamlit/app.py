@@ -1,12 +1,21 @@
-import streamlit as st
-import pandas as pd
+# app.py
+
+import io
+import os
+import time
+import tempfile
+import warnings
+
 import numpy as np
+import pandas as pd
+import streamlit as st
+
+from scipy.io import arff
 
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import MinMaxScaler, LabelEncoder
+from sklearn.preprocessing import MinMaxScaler, StandardScaler, LabelEncoder
 from sklearn.feature_selection import SelectKBest, chi2, mutual_info_classif, f_classif
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.svm import SVC
+
 from sklearn.metrics import (
     accuracy_score,
     precision_score,
@@ -17,707 +26,840 @@ from sklearn.metrics import (
     confusion_matrix,
 )
 
-try:
-    from xgboost import XGBClassifier
-    XGBOOST_AVAILABLE = True
-except Exception:
-    XGBOOST_AVAILABLE = False
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.svm import SVC
+from xgboost import XGBClassifier
 
+
+warnings.filterwarnings("ignore")
+
+
+# =========================================================
+# KONFIGURASI HALAMAN
+# =========================================================
 
 st.set_page_config(
-    page_title="Software Defect Prediction Dashboard",
-    page_icon="🧪",
-    layout="wide"
+    page_title="Software Defect Prediction",
+    page_icon="🔎",
+    layout="wide",
+)
+
+st.title("🔎 Software Defect Prediction Experiment")
+st.write(
+    """
+    Aplikasi ini digunakan untuk menjalankan eksperimen penelitian 
+    **Software Defect Prediction** menggunakan beberapa metode 
+    **Feature Selection** dan algoritma **Machine Learning**.
+    """
 )
 
 
-def normalize_column_name(col: str) -> str:
-    return str(col).strip().lower().replace(" ", "_").replace("-", "_")
+# =========================================================
+# FUNGSI MEMBACA DATASET
+# =========================================================
+
+def read_dataset(uploaded_file):
+    """
+    Membaca dataset dari file upload.
+    Format yang didukung: ARFF, CSV, XLSX, XLS.
+    """
+
+    filename = uploaded_file.name.lower()
+
+    if filename.endswith(".csv"):
+        df = pd.read_csv(uploaded_file)
+        return df
+
+    elif filename.endswith(".xlsx") or filename.endswith(".xls"):
+        df = pd.read_excel(uploaded_file)
+        return df
+
+    elif filename.endswith(".arff"):
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".arff") as tmp:
+            tmp.write(uploaded_file.getvalue())
+            tmp_path = tmp.name
+
+        try:
+            data, meta = arff.loadarff(tmp_path)
+            df = pd.DataFrame(data)
+
+            for col in df.columns:
+                if df[col].dtype == object:
+                    df[col] = df[col].apply(
+                        lambda x: x.decode("utf-8") if isinstance(x, bytes) else x
+                    )
+
+            return df
+
+        finally:
+            os.remove(tmp_path)
+
+    else:
+        raise ValueError("Format file tidak didukung. Gunakan ARFF, CSV, XLSX, atau XLS.")
 
 
-def detect_target_column(df: pd.DataFrame):
+# =========================================================
+# FUNGSI PREPROCESSING DATASET
+# =========================================================
+
+def detect_target_column(df):
     """
-    Mencoba menebak kolom target pada dataset defect prediction.
-    Dataset NASA MDP biasanya punya label seperti: defects, defect, bug, label, class.
+    Mendeteksi kolom target secara otomatis.
+    Jika tidak ditemukan, sistem akan memakai kolom terakhir.
     """
-    candidates = [
-        "defects", "defect", "bug", "bugs", "label", "class",
-        "target", "fault", "faults", "is_defective", "problem"
+
+    possible_targets = [
+        "defects",
+        "Defective",
+        "defective",
+        "bug",
+        "bugs",
+        "class",
+        "Class",
+        "target",
+        "Target",
+        "label",
+        "Label",
     ]
 
-    normalized_map = {normalize_column_name(c): c for c in df.columns}
-
-    for cand in candidates:
-        if cand in normalized_map:
-            return normalized_map[cand]
-
-    last_col = df.columns[-1]
-    unique_count = df[last_col].nunique(dropna=True)
-    if unique_count <= 5:
-        return last_col
+    for col in possible_targets:
+        if col in df.columns:
+            return col
 
     return df.columns[-1]
 
 
-def convert_target_to_binary(y: pd.Series) -> pd.Series:
+def encode_target(y):
     """
-    Mengubah label target menjadi 0/1.
-    Mendukung label: TRUE/FALSE, yes/no, defect/non-defect, Y/N, 1/0.
-    Jika target numerik berisi jumlah bug, nilai > 0 dianggap defect.
+    Mengubah target menjadi 0 dan 1.
     """
-    y_copy = y.copy()
 
-    if y_copy.dtype == "bool":
-        return y_copy.astype(int)
+    y = y.copy()
 
-    if pd.api.types.is_numeric_dtype(y_copy):
-        unique_values = sorted(pd.Series(y_copy.dropna().unique()).tolist())
-        if len(unique_values) == 2:
-            return y_copy.astype(int)
-        return (y_copy > 0).astype(int)
+    y = y.apply(lambda x: x.decode("utf-8") if isinstance(x, bytes) else x)
 
-    y_str = y_copy.astype(str).str.strip().str.lower()
+    if y.dtype == "object" or str(y.dtype) == "category" or y.dtype == bool:
+        y = y.astype(str).str.strip().str.lower()
 
-    positive_labels = {
-        "true", "yes", "y", "1", "defect", "defective", "bug", "faulty", "problem", "positive"
-    }
-    negative_labels = {
-        "false", "no", "n", "0", "non-defect", "non_defect", "clean", "not_defect", "negative"
-    }
+        mapping = {
+            "true": 1,
+            "false": 0,
+            "yes": 1,
+            "no": 0,
+            "y": 1,
+            "n": 0,
+            "defect": 1,
+            "defective": 1,
+            "bug": 1,
+            "buggy": 1,
+            "faulty": 1,
+            "clean": 0,
+            "non-defect": 0,
+            "non_defect": 0,
+            "not_buggy": 0,
+            "not faulty": 0,
+            "0": 0,
+            "1": 1,
+        }
 
-    mapped = []
-    for val in y_str:
-        if val in positive_labels:
-            mapped.append(1)
-        elif val in negative_labels:
-            mapped.append(0)
+        if set(y.dropna().unique()).issubset(set(mapping.keys())):
+            y = y.map(mapping)
         else:
-            mapped.append(np.nan)
+            encoder = LabelEncoder()
+            y = encoder.fit_transform(y)
 
-    mapped_series = pd.Series(mapped, index=y.index)
+    else:
+        y = pd.to_numeric(y, errors="coerce")
 
-    if mapped_series.isna().sum() == 0:
-        return mapped_series.astype(int)
-
-    encoder = LabelEncoder()
-    return pd.Series(encoder.fit_transform(y_str), index=y.index).astype(int)
+    return pd.Series(y)
 
 
-def clean_dataset(df: pd.DataFrame, target_col: str, missing_strategy: str):
+def preprocess_dataset(df, target_column=None):
     """
-    Membersihkan dataset:
-    - hapus duplikasi kolom
-    - pisahkan X dan y
-    - ambil fitur numerik saja
-    - tangani missing value
-    - ubah target menjadi binary
+    Tahapan preprocessing:
+    1. Merapikan nama kolom
+    2. Menentukan kolom target
+    3. Menghapus kolom ID/name/module jika ada
+    4. Mengubah target menjadi 0/1
+    5. Mengubah fitur menjadi numerik
+    6. Mengisi missing value dengan median
     """
+
     df = df.copy()
-    df.columns = [str(c).strip() for c in df.columns]
-    df = df.loc[:, ~df.columns.duplicated()]
+    df.columns = df.columns.astype(str).str.strip()
 
-    y = convert_target_to_binary(df[target_col])
+    if target_column and target_column in df.columns:
+        target_col = target_column
+    else:
+        target_col = detect_target_column(df)
+
+    possible_id_cols = ["id", "ID", "name", "Name", "module", "Module"]
+
+    for col in possible_id_cols:
+        if col in df.columns and col != target_col:
+            df = df.drop(columns=[col])
+
+    y = encode_target(df[target_col])
+
     X = df.drop(columns=[target_col])
 
-    # Dataset NASA MDP umumnya berisi software metrics numerik.
-    X = X.select_dtypes(include=[np.number])
+    for col in X.columns:
+        if X[col].dtype == object:
+            X[col] = X[col].apply(
+                lambda x: x.decode("utf-8") if isinstance(x, bytes) else x
+            )
 
-    data = pd.concat([X, y.rename("target")], axis=1)
+    X = X.apply(pd.to_numeric, errors="coerce")
+    X = X.dropna(axis=1, how="all")
+    X = X.replace([np.inf, -np.inf], np.nan)
+    X = X.fillna(X.median(numeric_only=True))
 
-    if missing_strategy == "Drop rows":
-        data = data.dropna()
-    elif missing_strategy == "Fill with median":
-        feature_cols = [c for c in data.columns if c != "target"]
-        data[feature_cols] = data[feature_cols].fillna(data[feature_cols].median(numeric_only=True))
-        data = data.dropna(subset=["target"])
-    else:
-        feature_cols = [c for c in data.columns if c != "target"]
-        data[feature_cols] = data[feature_cols].fillna(0)
-        data = data.dropna(subset=["target"])
+    valid_idx = y.notna()
+    X = X.loc[valid_idx]
+    y = y.loc[valid_idx].astype(int).values
 
-    X_clean = data.drop(columns=["target"])
-    y_clean = data["target"].astype(int)
-
-    # Hilangkan kolom konstan karena tidak informatif.
-    nunique = X_clean.nunique(dropna=True)
-    X_clean = X_clean.loc[:, nunique > 1]
-
-    return X_clean, y_clean
+    return X, y, target_col
 
 
-def get_selector(method: str, k: int):
-    if method == "Chi-Square":
-        return SelectKBest(score_func=chi2, k=k)
-    if method == "Mutual Information":
-        return SelectKBest(score_func=mutual_info_classif, k=k)
-    if method == "ANOVA F-test":
-        return SelectKBest(score_func=f_classif, k=k)
-    return None
+# =========================================================
+# FUNGSI FEATURE SELECTION
+# =========================================================
 
-
-def get_model(model_name: str, random_state: int, use_class_weight: bool):
-    if model_name == "Random Forest":
-        return RandomForestClassifier(
-            n_estimators=200,
-            random_state=random_state,
-            class_weight="balanced" if use_class_weight else None,
-            n_jobs=-1,
-        )
-
-    if model_name == "Support Vector Machine":
-        return SVC(
-            kernel="rbf",
-            probability=True,
-            random_state=random_state,
-            class_weight="balanced" if use_class_weight else None,
-        )
-
-    if model_name == "XGBoost":
-        if not XGBOOST_AVAILABLE:
-            raise ImportError("XGBoost belum terinstall. Jalankan: pip install xgboost")
-
-        return XGBClassifier(
-            n_estimators=200,
-            learning_rate=0.05,
-            max_depth=4,
-            subsample=0.9,
-            colsample_bytree=0.9,
-            eval_metric="logloss",
-            random_state=random_state,
-            n_jobs=-1,
-        )
-
-    raise ValueError("Model tidak dikenali.")
-
-
-def evaluate_model(y_true, y_pred, y_proba=None):
-    result = {
-        "Accuracy": accuracy_score(y_true, y_pred),
-        "Precision": precision_score(y_true, y_pred, zero_division=0),
-        "Recall": recall_score(y_true, y_pred, zero_division=0),
-        "F1-score": f1_score(y_true, y_pred, zero_division=0),
-        "MCC": matthews_corrcoef(y_true, y_pred),
-    }
-
-    try:
-        if y_proba is not None and len(np.unique(y_true)) == 2:
-            result["AUC"] = roc_auc_score(y_true, y_proba)
-        else:
-            result["AUC"] = np.nan
-    except Exception:
-        result["AUC"] = np.nan
-
-    return result
-
-
-def run_experiment(
-    X,
-    y,
-    feature_selection_method,
-    k_value,
-    model_name,
-    test_size,
-    random_state,
-    use_class_weight
-):
+def apply_feature_selection(method, X_train, y_train, X_test, k=None):
     """
-    Menjalankan satu skenario eksperimen:
-    stratified split -> scaling -> feature selection -> training -> evaluation.
+    Menerapkan feature selection:
+    - none
+    - chi2
+    - mutual_info
+    - anova
     """
-    X_train, X_test, y_train, y_test = train_test_split(
-        X,
-        y,
-        test_size=test_size,
-        random_state=random_state,
-        stratify=y
-    )
 
-    scaler = MinMaxScaler()
-    X_train_scaled = pd.DataFrame(
-        scaler.fit_transform(X_train),
-        columns=X_train.columns,
-        index=X_train.index
-    )
-    X_test_scaled = pd.DataFrame(
-        scaler.transform(X_test),
-        columns=X_test.columns,
-        index=X_test.index
-    )
+    if method == "none":
+        selected_features = list(X_train.columns)
+        return X_train.values, X_test.values, selected_features
 
-    selected_features = list(X_train_scaled.columns)
-    feature_score_df = pd.DataFrame()
+    if k is None:
+        raise ValueError("Nilai k harus diisi.")
 
-    if feature_selection_method != "No Feature Selection":
-        k = min(int(k_value), X_train_scaled.shape[1])
-        selector = get_selector(feature_selection_method, k)
+    k = min(k, X_train.shape[1])
+
+    if method == "chi2":
+        scaler = MinMaxScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_test_scaled = scaler.transform(X_test)
+
+        selector = SelectKBest(score_func=chi2, k=k)
         X_train_selected = selector.fit_transform(X_train_scaled, y_train)
         X_test_selected = selector.transform(X_test_scaled)
 
-        support = selector.get_support()
-        selected_features = list(X_train_scaled.columns[support])
+    elif method == "mutual_info":
+        selector = SelectKBest(score_func=mutual_info_classif, k=k)
+        X_train_selected = selector.fit_transform(X_train, y_train)
+        X_test_selected = selector.transform(X_test)
 
-        if hasattr(selector, "scores_"):
-            feature_score_df = pd.DataFrame({
-                "Feature": X_train_scaled.columns,
-                "Score": selector.scores_
-            }).sort_values("Score", ascending=False)
+    elif method == "anova":
+        selector = SelectKBest(score_func=f_classif, k=k)
+        X_train_selected = selector.fit_transform(X_train, y_train)
+        X_test_selected = selector.transform(X_test)
 
     else:
-        X_train_selected = X_train_scaled
-        X_test_selected = X_test_scaled
-        k = "All"
+        raise ValueError("Metode feature selection tidak dikenal.")
 
-    model = get_model(model_name, random_state, use_class_weight)
-    model.fit(X_train_selected, y_train)
+    selected_features = list(X_train.columns[selector.get_support()])
 
-    y_pred = model.predict(X_test_selected)
+    return X_train_selected, X_test_selected, selected_features
 
-    y_proba = None
-    if hasattr(model, "predict_proba"):
-        try:
-            y_proba = model.predict_proba(X_test_selected)[:, 1]
-        except Exception:
-            y_proba = None
 
-    metrics = evaluate_model(y_test, y_pred, y_proba)
-    cm = confusion_matrix(y_test, y_pred)
+# =========================================================
+# FUNGSI MODEL
+# =========================================================
 
-    summary = {
-        "Feature Selection": feature_selection_method,
-        "k": k,
-        "Model": model_name,
-        **metrics,
-        "Selected Features": ", ".join(selected_features)
+def get_models(selected_models):
+    """
+    Mengambil model yang dipilih user.
+    """
+
+    all_models = {
+        "Random Forest": RandomForestClassifier(
+            n_estimators=100,
+            random_state=42,
+            class_weight="balanced",
+        ),
+
+        "SVM": SVC(
+            kernel="rbf",
+            probability=True,
+            random_state=42,
+            class_weight="balanced",
+        ),
+
+        "XGBoost": XGBClassifier(
+            n_estimators=100,
+            learning_rate=0.1,
+            max_depth=5,
+            random_state=42,
+            eval_metric="logloss",
+        ),
     }
 
-    return summary, cm, selected_features, feature_score_df
+    return {name: all_models[name] for name in selected_models}
 
 
-def build_sample_dataset(n_samples=600, random_state=42):
+# =========================================================
+# FUNGSI EVALUASI
+# =========================================================
+
+def evaluate_model(model, X_test, y_test):
     """
-    Dataset dummy untuk uji tampilan.
-    Ini BUKAN NASA MDP asli, hanya contoh agar aplikasi bisa dicoba tanpa file eksternal.
+    Menghitung metrik evaluasi model.
     """
-    rng = np.random.default_rng(random_state)
 
-    loc = rng.normal(40, 15, n_samples).clip(1, None)
-    v_g = rng.normal(8, 4, n_samples).clip(1, None)
-    ev_g = v_g + rng.normal(0, 2, n_samples)
-    iv_g = v_g + rng.normal(0, 2, n_samples)
-    n = rng.normal(120, 50, n_samples).clip(1, None)
-    v = n * rng.normal(4, 1, n_samples).clip(0.5, None)
-    l = rng.random(n_samples)
-    d = rng.normal(20, 8, n_samples).clip(1, None)
-    i = rng.normal(30, 12, n_samples).clip(1, None)
-    e = v * d
-    b = v / 3000
-    t = e / 18
-    lOCode = loc * rng.uniform(0.3, 0.7, n_samples)
-    lOComment = loc * rng.uniform(0.0, 0.15, n_samples)
-    uniq_Op = rng.integers(4, 40, n_samples)
-    uniq_Opnd = rng.integers(4, 80, n_samples)
-    total_Op = rng.integers(20, 300, n_samples)
-    total_Opnd = rng.integers(20, 300, n_samples)
-    branch_count = rng.integers(1, 50, n_samples)
+    y_pred = model.predict(X_test)
 
-    risk_score = (
-        0.025 * loc +
-        0.10 * v_g +
-        0.00002 * e +
-        0.03 * branch_count +
-        rng.normal(0, 1, n_samples)
-    )
-    threshold = np.quantile(risk_score, 0.78)
-    defects = (risk_score > threshold).astype(int)
-
-    return pd.DataFrame({
-        "loc": loc.round(3),
-        "v(g)": v_g.round(3),
-        "ev(g)": ev_g.round(3),
-        "iv(g)": iv_g.round(3),
-        "n": n.round(3),
-        "v": v.round(3),
-        "l": l.round(3),
-        "d": d.round(3),
-        "i": i.round(3),
-        "e": e.round(3),
-        "b": b.round(3),
-        "t": t.round(3),
-        "lOCode": lOCode.round(3),
-        "lOComment": lOComment.round(3),
-        "uniq_Op": uniq_Op,
-        "uniq_Opnd": uniq_Opnd,
-        "total_Op": total_Op,
-        "total_Opnd": total_Opnd,
-        "branchCount": branch_count,
-        "defects": defects
-    })
-
-
-def dataset_summary(X: pd.DataFrame, y: pd.Series):
-    total = len(y)
-    defect_count = int((y == 1).sum())
-    non_defect_count = int((y == 0).sum())
-    defect_ratio = defect_count / total if total else 0
-
-    return {
-        "Jumlah Data": total,
-        "Jumlah Fitur Numerik": X.shape[1],
-        "Non-Defect": non_defect_count,
-        "Defect": defect_count,
-        "Defect Ratio": defect_ratio
-    }
-
-
-st.sidebar.title("🧪 SDP Dashboard")
-page = st.sidebar.radio(
-    "Menu",
-    [
-        "1. Dataset",
-        "2. Single Experiment",
-        "3. Run All Scenarios",
-        "4. About"
-    ]
-)
-
-st.title("Software Defect Prediction Dashboard")
-st.caption(
-    "Implementasi Streamlit untuk eksperimen Feature Selection dan Machine Learning "
-    "pada Software Defect Prediction berbasis NASA MDP."
-)
-
-with st.sidebar.expander("Dataset", expanded=True):
-    data_source = st.radio(
-        "Sumber dataset",
-        ["Upload CSV", "Use sample dataset"]
-    )
-
-    uploaded_file = None
-    if data_source == "Upload CSV":
-        uploaded_file = st.file_uploader("Upload file CSV", type=["csv"])
-
-if data_source == "Use sample dataset":
-    df = build_sample_dataset()
-else:
-    if uploaded_file is not None:
-        df = pd.read_csv(uploaded_file)
-    else:
-        df = None
-
-if df is None:
-    st.info("Upload dataset CSV terlebih dahulu atau gunakan sample dataset dari sidebar.")
-    st.stop()
-
-target_guess = detect_target_column(df)
-
-with st.sidebar.expander("Preprocessing", expanded=True):
-    target_col = st.selectbox(
-        "Kolom target/label defect",
-        options=list(df.columns),
-        index=list(df.columns).index(target_guess) if target_guess in df.columns else len(df.columns) - 1
-    )
-
-    missing_strategy = st.selectbox(
-        "Missing value",
-        ["Drop rows", "Fill with median", "Fill with zero"]
-    )
-
-try:
-    X, y = clean_dataset(df, target_col, missing_strategy)
-except Exception as e:
-    st.error(f"Gagal memproses dataset: {e}")
-    st.stop()
-
-if X.shape[1] == 0:
-    st.error("Tidak ada fitur numerik yang bisa digunakan. Pastikan dataset berisi software metrics numerik.")
-    st.stop()
-
-if y.nunique() != 2:
-    st.error("Target harus berupa klasifikasi biner: defect dan non-defect.")
-    st.stop()
-
-if min(y.value_counts()) < 2:
-    st.error("Setiap kelas minimal harus memiliki 2 data agar stratified split bisa dilakukan.")
-    st.stop()
-
-
-if page == "1. Dataset":
-    st.header("1. Dataset Overview")
-
-    summary = dataset_summary(X, y)
-    col1, col2, col3, col4, col5 = st.columns(5)
-    col1.metric("Jumlah Data", summary["Jumlah Data"])
-    col2.metric("Jumlah Fitur", summary["Jumlah Fitur Numerik"])
-    col3.metric("Non-Defect", summary["Non-Defect"])
-    col4.metric("Defect", summary["Defect"])
-    col5.metric("Defect Ratio", f"{summary['Defect Ratio']:.2%}")
-
-    st.subheader("Preview Dataset")
-    st.dataframe(df.head(20), use_container_width=True)
-
-    st.subheader("Fitur Numerik yang Digunakan")
-    st.dataframe(pd.DataFrame({"Feature": X.columns}), use_container_width=True)
-
-    st.subheader("Distribusi Kelas")
-    class_dist = pd.DataFrame({
-        "Class": ["Non-Defect", "Defect"],
-        "Count": [summary["Non-Defect"], summary["Defect"]]
-    })
-    st.bar_chart(class_dist.set_index("Class"))
-
-    st.subheader("Missing Value per Kolom")
-    missing_df = df.isnull().sum().reset_index()
-    missing_df.columns = ["Column", "Missing Count"]
-    st.dataframe(missing_df, use_container_width=True)
-
-
-def experiment_sidebar():
-    with st.sidebar.expander("Experiment Settings", expanded=True):
-        fs_method = st.selectbox(
-            "Feature Selection",
-            ["No Feature Selection", "Chi-Square", "Mutual Information", "ANOVA F-test"]
-        )
-
-        k_value = st.selectbox("Jumlah fitur k", [5, 10, 15, 20])
-
-        model_options = ["Random Forest", "Support Vector Machine"]
-        if XGBOOST_AVAILABLE:
-            model_options.append("XGBoost")
+    try:
+        if hasattr(model, "predict_proba"):
+            y_proba = model.predict_proba(X_test)[:, 1]
         else:
-            st.warning("XGBoost belum tersedia. Install dengan: pip install xgboost")
+            y_proba = y_pred
 
-        model_name = st.selectbox("Model", model_options)
+        auc = roc_auc_score(y_test, y_proba)
 
-        test_size = st.slider("Test size", 0.1, 0.5, 0.2, 0.05)
-        random_state = st.number_input("Random state", min_value=0, value=42)
+    except Exception:
+        auc = np.nan
 
-        use_class_weight = st.checkbox(
-            "Gunakan class_weight balanced",
-            value=False,
-            help="Aktifkan jika dataset sangat imbalanced. Untuk mendekati eksperimen dasar paper, biarkan OFF."
-        )
+    metrics = {
+        "accuracy": accuracy_score(y_test, y_pred),
+        "precision": precision_score(y_test, y_pred, zero_division=0),
+        "recall": recall_score(y_test, y_pred, zero_division=0),
+        "f1_score": f1_score(y_test, y_pred, zero_division=0),
+        "auc": auc,
+        "mcc": matthews_corrcoef(y_test, y_pred),
+    }
 
-    return fs_method, k_value, model_name, test_size, random_state, use_class_weight
-
-
-if page == "2. Single Experiment":
-    st.header("2. Single Experiment")
-
-    fs_method, k_value, model_name, test_size, random_state, use_class_weight = experiment_sidebar()
-
-    st.write(
-        "Jalankan satu kombinasi eksperimen: metode feature selection, nilai k, dan algoritma machine learning."
-    )
-
-    if st.button("🚀 Jalankan Eksperimen", type="primary"):
-        try:
-            result, cm, selected_features, feature_score_df = run_experiment(
-                X=X,
-                y=y,
-                feature_selection_method=fs_method,
-                k_value=k_value,
-                model_name=model_name,
-                test_size=test_size,
-                random_state=int(random_state),
-                use_class_weight=use_class_weight
-            )
-
-            st.subheader("Hasil Evaluasi")
-
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Accuracy", f"{result['Accuracy']:.4f}")
-            c2.metric("Precision", f"{result['Precision']:.4f}")
-            c3.metric("Recall", f"{result['Recall']:.4f}")
-
-            c4, c5, c6 = st.columns(3)
-            c4.metric("F1-score", f"{result['F1-score']:.4f}")
-            c5.metric("AUC", f"{result['AUC']:.4f}" if not pd.isna(result["AUC"]) else "N/A")
-            c6.metric("MCC", f"{result['MCC']:.4f}")
-
-            st.subheader("Ringkasan Skenario")
-            result_df = pd.DataFrame([result])
-            st.dataframe(result_df, use_container_width=True)
-
-            st.subheader("Confusion Matrix")
-            cm_df = pd.DataFrame(
-                cm,
-                index=["Actual Non-Defect", "Actual Defect"],
-                columns=["Predicted Non-Defect", "Predicted Defect"]
-            )
-            st.dataframe(cm_df, use_container_width=True)
-
-            st.subheader("Fitur yang Digunakan Model")
-            st.write(selected_features)
-
-            if not feature_score_df.empty:
-                st.subheader("Ranking Feature Score")
-                st.dataframe(feature_score_df, use_container_width=True)
-                st.bar_chart(feature_score_df.head(15).set_index("Feature")["Score"])
-
-        except Exception as e:
-            st.error(f"Terjadi error saat eksperimen: {e}")
+    return metrics, y_pred
 
 
-if page == "3. Run All Scenarios":
-    st.header("3. Run All Scenarios")
+# =========================================================
+# FUNGSI EXPORT EXCEL
+# =========================================================
 
-    st.write(
-        "Menu ini menjalankan seluruh skenario seperti rancangan paper: "
-        "3 feature selection × 4 nilai k × 3 model + baseline no feature selection."
-    )
+def create_excel_file(
+    dataset_summary_df,
+    results_df,
+    best_by_dataset,
+    best_overall,
+    summary_by_model,
+    summary_by_fs,
+    summary_by_k,
+    summary_by_combination,
+    selected_features_df,
+):
+    """
+    Membuat file Excel hasil eksperimen.
+    """
 
-    with st.sidebar.expander("Run All Settings", expanded=True):
-        test_size_all = st.slider("Test size", 0.1, 0.5, 0.2, 0.05, key="test_size_all")
-        random_state_all = st.number_input("Random state", min_value=0, value=42, key="random_state_all")
-        use_class_weight_all = st.checkbox(
-            "Gunakan class_weight balanced",
-            value=False,
-            key="cw_all"
-        )
+    output = io.BytesIO()
 
-    model_list = ["Random Forest", "Support Vector Machine"]
-    if XGBOOST_AVAILABLE:
-        model_list.append("XGBoost")
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        dataset_summary_df.to_excel(writer, sheet_name="Dataset Summary", index=False)
+        results_df.to_excel(writer, sheet_name="All Results", index=False)
+        best_by_dataset.to_excel(writer, sheet_name="Best Per Dataset", index=False)
+        best_overall.to_excel(writer, sheet_name="Best Overall", index=False)
+        summary_by_model.to_excel(writer, sheet_name="Summary Model", index=False)
+        summary_by_fs.to_excel(writer, sheet_name="Summary FS", index=False)
 
-    if st.button("🚀 Jalankan Semua Skenario", type="primary"):
-        scenarios = []
+        if not summary_by_k.empty:
+            summary_by_k.to_excel(writer, sheet_name="Summary K", index=False)
 
-        feature_selection_methods = ["ANOVA F-test", "Chi-Square", "Mutual Information"]
-        k_values = [5, 10, 15, 20]
+        summary_by_combination.to_excel(writer, sheet_name="Summary Combination", index=False)
+        selected_features_df.to_excel(writer, sheet_name="Selected Features", index=False)
 
-        progress_bar = st.progress(0)
-        total_runs = (len(feature_selection_methods) * len(k_values) * len(model_list)) + len(model_list)
-        run_count = 0
+    output.seek(0)
 
-        for fs in feature_selection_methods:
-            for k in k_values:
-                for model in model_list:
-                    try:
-                        result, _, _, _ = run_experiment(
-                            X=X,
-                            y=y,
-                            feature_selection_method=fs,
-                            k_value=k,
-                            model_name=model,
-                            test_size=test_size_all,
-                            random_state=int(random_state_all),
-                            use_class_weight=use_class_weight_all
-                        )
-                        scenarios.append(result)
-                    except Exception as e:
-                        scenarios.append({
-                            "Feature Selection": fs,
-                            "k": k,
-                            "Model": model,
-                            "Error": str(e)
-                        })
+    return output
 
-                    run_count += 1
-                    progress_bar.progress(run_count / total_runs)
 
-        for model in model_list:
+# =========================================================
+# SIDEBAR INPUT
+# =========================================================
+
+st.sidebar.header("⚙️ Pengaturan Eksperimen")
+
+uploaded_files = st.sidebar.file_uploader(
+    "Upload dataset",
+    type=["arff", "csv", "xlsx", "xls"],
+    accept_multiple_files=True,
+)
+
+target_column_input = st.sidebar.text_input(
+    "Nama kolom target, opsional",
+    value="",
+    help="Kosongkan jika ingin target dideteksi otomatis.",
+)
+
+selected_fs = st.sidebar.multiselect(
+    "Pilih Feature Selection",
+    options=[
+        "No Feature Selection",
+        "Chi-Square",
+        "Mutual Information",
+        "ANOVA F-test",
+    ],
+    default=[
+        "No Feature Selection",
+        "Chi-Square",
+        "Mutual Information",
+        "ANOVA F-test",
+    ],
+)
+
+selected_k = st.sidebar.multiselect(
+    "Pilih nilai k",
+    options=[5, 10, 15, 20],
+    default=[5, 10, 15, 20],
+)
+
+selected_models = st.sidebar.multiselect(
+    "Pilih Model",
+    options=["Random Forest", "SVM", "XGBoost"],
+    default=["Random Forest", "SVM", "XGBoost"],
+)
+
+test_size = st.sidebar.slider(
+    "Test Size",
+    min_value=0.1,
+    max_value=0.4,
+    value=0.2,
+    step=0.05,
+)
+
+random_state = st.sidebar.number_input(
+    "Random State",
+    min_value=0,
+    value=42,
+    step=1,
+)
+
+run_button = st.sidebar.button("🚀 Jalankan Eksperimen")
+
+
+# =========================================================
+# TAMPILAN AWAL
+# =========================================================
+
+st.subheader("📌 Alur Penelitian")
+
+st.markdown(
+    """
+    Alur aplikasi:
+
+    1. Upload dataset.
+    2. Sistem melakukan preprocessing.
+    3. Dataset dibagi menjadi data training dan testing.
+    4. Sistem melakukan feature selection.
+    5. Model dilatih menggunakan data training.
+    6. Model diuji menggunakan data testing.
+    7. Hasil evaluasi ditampilkan dan dapat diunduh dalam format Excel.
+    """
+)
+
+if uploaded_files:
+    st.subheader("📁 Preview Dataset")
+
+    tabs = st.tabs([file.name for file in uploaded_files])
+
+    for tab, uploaded_file in zip(tabs, uploaded_files):
+        with tab:
             try:
-                result, _, _, _ = run_experiment(
-                    X=X,
-                    y=y,
-                    feature_selection_method="No Feature Selection",
-                    k_value=0,
-                    model_name=model,
-                    test_size=test_size_all,
-                    random_state=int(random_state_all),
-                    use_class_weight=use_class_weight_all
+                df_preview = read_dataset(uploaded_file)
+
+                st.write(
+                    f"Ukuran dataset: **{df_preview.shape[0]} baris** × "
+                    f"**{df_preview.shape[1]} kolom**"
                 )
-                scenarios.append(result)
+
+                detected_target = detect_target_column(df_preview)
+                st.write(f"Kolom target terdeteksi: **{detected_target}**")
+
+                st.dataframe(df_preview.head(10), use_container_width=True)
+
             except Exception as e:
-                scenarios.append({
-                    "Feature Selection": "No Feature Selection",
-                    "k": "All",
-                    "Model": model,
-                    "Error": str(e)
+                st.error(f"Gagal membaca dataset: {e}")
+
+else:
+    st.info("Silakan upload dataset terlebih dahulu melalui sidebar.")
+
+
+# =========================================================
+# PROSES EKSPERIMEN
+# =========================================================
+
+if run_button:
+
+    if not uploaded_files:
+        st.error("Dataset belum diupload.")
+        st.stop()
+
+    if not selected_fs:
+        st.error("Pilih minimal satu metode feature selection.")
+        st.stop()
+
+    if not selected_models:
+        st.error("Pilih minimal satu model.")
+        st.stop()
+
+    if any(fs != "No Feature Selection" for fs in selected_fs) and not selected_k:
+        st.error("Pilih minimal satu nilai k.")
+        st.stop()
+
+    feature_methods = {
+        "No Feature Selection": "none",
+        "Chi-Square": "chi2",
+        "Mutual Information": "mutual_info",
+        "ANOVA F-test": "anova",
+    }
+
+    dataset_summary = []
+    results = []
+    selected_features_records = []
+
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+
+    total_process = len(uploaded_files) * len(selected_fs) * len(selected_models)
+    current_process = 0
+
+    for uploaded_file in uploaded_files:
+
+        dataset_name = os.path.splitext(uploaded_file.name)[0]
+
+        status_text.info(f"Memproses dataset: {dataset_name}")
+
+        df = read_dataset(uploaded_file)
+
+        target_column = target_column_input.strip() if target_column_input.strip() else None
+
+        X, y, target_col = preprocess_dataset(df, target_column)
+
+        class_dist = pd.Series(y).value_counts().to_dict()
+
+        dataset_summary.append({
+            "dataset": dataset_name,
+            "target_column": target_col,
+            "num_data": X.shape[0],
+            "num_features": X.shape[1],
+            "class_0": class_dist.get(0, 0),
+            "class_1": class_dist.get(1, 0),
+            "defect_ratio": class_dist.get(1, 0) / X.shape[0],
+        })
+
+        if len(np.unique(y)) < 2:
+            st.warning(f"Dataset {dataset_name} dilewati karena hanya memiliki satu kelas.")
+            continue
+
+        X_train, X_test, y_train, y_test = train_test_split(
+            X,
+            y,
+            test_size=test_size,
+            random_state=int(random_state),
+            stratify=y,
+        )
+
+        for fs_name in selected_fs:
+
+            fs_method = feature_methods[fs_name]
+
+            if fs_method == "none":
+                k_values = ["all"]
+            else:
+                k_values = selected_k
+
+            for k in k_values:
+
+                if fs_method == "none":
+                    X_train_fs, X_test_fs, selected_features = apply_feature_selection(
+                        method=fs_method,
+                        X_train=X_train,
+                        y_train=y_train,
+                        X_test=X_test,
+                        k=None,
+                    )
+
+                    actual_k = X_train.shape[1]
+
+                else:
+                    X_train_fs, X_test_fs, selected_features = apply_feature_selection(
+                        method=fs_method,
+                        X_train=X_train,
+                        y_train=y_train,
+                        X_test=X_test,
+                        k=int(k),
+                    )
+
+                    actual_k = len(selected_features)
+
+                selected_features_records.append({
+                    "dataset": dataset_name,
+                    "feature_selection": fs_name,
+                    "k_requested": k,
+                    "k_actual": actual_k,
+                    "selected_features": ", ".join(selected_features),
                 })
 
-            run_count += 1
-            progress_bar.progress(run_count / total_runs)
+                models = get_models(selected_models)
 
-        results_df = pd.DataFrame(scenarios)
+                for model_name, model in models.items():
 
-        metric_cols = ["Accuracy", "Precision", "Recall", "F1-score", "AUC", "MCC"]
-        for col in metric_cols:
-            if col in results_df.columns:
-                results_df[col] = pd.to_numeric(results_df[col], errors="coerce")
+                    status_text.info(
+                        f"Dataset: {dataset_name} | FS: {fs_name} | "
+                        f"k: {k} | Model: {model_name}"
+                    )
 
-        st.subheader("Tabel Semua Skenario")
-        st.dataframe(results_df, use_container_width=True)
+                    X_train_model = X_train_fs
+                    X_test_model = X_test_fs
 
-        st.subheader("Top 10 Berdasarkan F1-score")
-        if "F1-score" in results_df.columns:
-            top_f1 = results_df.sort_values(["F1-score", "MCC"], ascending=False).head(10)
-            st.dataframe(top_f1, use_container_width=True)
+                    if model_name == "SVM":
+                        scaler = StandardScaler()
+                        X_train_model = scaler.fit_transform(X_train_model)
+                        X_test_model = scaler.transform(X_test_model)
 
-        st.subheader("Rata-rata Berdasarkan Model")
-        available_metrics = [c for c in metric_cols if c in results_df.columns]
-        if available_metrics:
-            avg_model = results_df.groupby("Model")[available_metrics].mean().reset_index()
-            st.dataframe(avg_model, use_container_width=True)
+                    start_time = time.time()
+                    model.fit(X_train_model, y_train)
+                    training_time = time.time() - start_time
 
-            st.subheader("Rata-rata Berdasarkan Feature Selection")
-            avg_fs = results_df.groupby("Feature Selection")[available_metrics].mean().reset_index()
-            st.dataframe(avg_fs, use_container_width=True)
+                    metrics, y_pred = evaluate_model(model, X_test_model, y_test)
 
-            if "F1-score" in avg_model.columns:
-                st.subheader("Perbandingan F1-score per Model")
-                chart_df = avg_model[["Model", "F1-score"]].set_index("Model")
-                st.bar_chart(chart_df)
+                    cm = confusion_matrix(y_test, y_pred)
 
-        csv = results_df.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            label="⬇️ Download hasil eksperimen CSV",
-            data=csv,
-            file_name="sdp_experiment_results.csv",
-            mime="text/csv"
+                    if cm.shape == (2, 2):
+                        tn, fp, fn, tp = cm.ravel()
+                    else:
+                        tn, fp, fn, tp = np.nan, np.nan, np.nan, np.nan
+
+                    results.append({
+                        "dataset": dataset_name,
+                        "target_column": target_col,
+                        "feature_selection": fs_name,
+                        "k_requested": k,
+                        "k_actual": actual_k,
+                        "model": model_name,
+                        "accuracy": metrics["accuracy"],
+                        "precision": metrics["precision"],
+                        "recall": metrics["recall"],
+                        "f1_score": metrics["f1_score"],
+                        "auc": metrics["auc"],
+                        "mcc": metrics["mcc"],
+                        "training_time_seconds": training_time,
+                        "tn": tn,
+                        "fp": fp,
+                        "fn": fn,
+                        "tp": tp,
+                    })
+
+                    current_process += 1
+                    progress_bar.progress(min(current_process / total_process, 1.0))
+
+    status_text.success("Eksperimen selesai.")
+
+    dataset_summary_df = pd.DataFrame(dataset_summary)
+    results_df = pd.DataFrame(results)
+    selected_features_df = pd.DataFrame(selected_features_records)
+
+    if results_df.empty:
+        st.error("Tidak ada hasil eksperimen.")
+        st.stop()
+
+    # =========================================================
+    # RINGKASAN HASIL
+    # =========================================================
+
+    best_by_dataset = (
+        results_df
+        .sort_values(
+            by=["dataset", "f1_score", "auc", "mcc"],
+            ascending=[True, False, False, False],
+        )
+        .groupby("dataset")
+        .head(1)
+        .reset_index(drop=True)
+    )
+
+    best_overall = results_df.sort_values(
+        by=["f1_score", "auc", "mcc"],
+        ascending=[False, False, False],
+    ).head(10)
+
+    summary_by_model = (
+        results_df
+        .groupby("model")[
+            [
+                "accuracy",
+                "precision",
+                "recall",
+                "f1_score",
+                "auc",
+                "mcc",
+                "training_time_seconds",
+            ]
+        ]
+        .mean()
+        .reset_index()
+        .sort_values(by="f1_score", ascending=False)
+    )
+
+    summary_by_fs = (
+        results_df
+        .groupby("feature_selection")[
+            [
+                "accuracy",
+                "precision",
+                "recall",
+                "f1_score",
+                "auc",
+                "mcc",
+                "training_time_seconds",
+            ]
+        ]
+        .mean()
+        .reset_index()
+        .sort_values(by="f1_score", ascending=False)
+    )
+
+    fs_only_df = results_df[results_df["feature_selection"] != "No Feature Selection"]
+
+    if fs_only_df.empty:
+        summary_by_k = pd.DataFrame()
+    else:
+        summary_by_k = (
+            fs_only_df
+            .groupby("k_requested")[
+                [
+                    "accuracy",
+                    "precision",
+                    "recall",
+                    "f1_score",
+                    "auc",
+                    "mcc",
+                    "training_time_seconds",
+                ]
+            ]
+            .mean()
+            .reset_index()
+            .sort_values(by="f1_score", ascending=False)
         )
 
+    summary_by_combination = (
+        results_df
+        .groupby(["feature_selection", "k_requested", "model"])[
+            [
+                "accuracy",
+                "precision",
+                "recall",
+                "f1_score",
+                "auc",
+                "mcc",
+                "training_time_seconds",
+            ]
+        ]
+        .mean()
+        .reset_index()
+        .sort_values(
+            by=["f1_score", "auc", "mcc"],
+            ascending=[False, False, False],
+        )
+    )
 
-if page == "4. About":
-    st.header("4. About This App")
+    # =========================================================
+    # TAMPILAN HASIL
+    # =========================================================
+
+    st.success("✅ Hasil eksperimen berhasil dibuat.")
+
+    st.subheader("📊 Ringkasan Dataset")
+    st.dataframe(dataset_summary_df, use_container_width=True)
+
+    best_row = best_overall.iloc[0]
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    col1.metric("Model Terbaik", best_row["model"])
+    col2.metric("F1-score", f"{best_row['f1_score']:.4f}")
+    col3.metric("AUC", f"{best_row['auc']:.4f}")
+    col4.metric("MCC", f"{best_row['mcc']:.4f}")
 
     st.markdown(
-        """
-        Aplikasi ini dibuat sebagai implementasi web dari paper:
+        f"""
+        **Kombinasi terbaik** berdasarkan F1-score adalah:
 
-        **Comparative Analysis of Feature Selection Methods and Machine Learning Algorithms for Software Defect Prediction Using NASA MDP Datasets**
+        **{best_row['feature_selection']} | k = {best_row['k_requested']} | {best_row['model']}**
 
-        ### Tujuan Aplikasi
-        Aplikasi ini membantu menjalankan ulang eksperimen software defect prediction secara interaktif.
-        Pengguna dapat mengunggah dataset NASA MDP dalam format CSV, memilih metode feature selection,
-        memilih jumlah fitur, memilih algoritma machine learning, lalu melihat hasil evaluasi model.
-
-        ### Metode Feature Selection
-        - No Feature Selection
-        - Chi-Square
-        - Mutual Information
-        - ANOVA F-test
-
-        ### Algoritma Machine Learning
-        - Random Forest
-        - Support Vector Machine
-        - XGBoost
-
-        ### Metrik Evaluasi
-        - Accuracy
-        - Precision
-        - Recall
-        - F1-score
-        - AUC
-        - MCC
-
-        ### Catatan Penting
-        Dataset NASA MDP memiliki karakteristik class imbalance. Karena itu, evaluasi tidak cukup hanya
-        menggunakan accuracy. Metrik seperti recall, F1-score, AUC, dan MCC lebih penting untuk menilai
-        kemampuan model dalam mendeteksi modul defect.
+        Dataset: **{best_row['dataset']}**  
+        F1-score: **{best_row['f1_score']:.4f}**  
+        AUC: **{best_row['auc']:.4f}**  
+        MCC: **{best_row['mcc']:.4f}**
         """
     )
 
-    st.info(
-        "Untuk hasil yang mendekati paper, gunakan dataset NASA MDP asli seperti JM1, KC1, PC1, CM1, dan KC3."
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+        "All Results",
+        "Best Per Dataset",
+        "Best Overall",
+        "Summary Model",
+        "Summary FS",
+        "Summary K",
+        "Summary Combination",
+        "Selected Features",
+    ])
+
+    with tab1:
+        st.dataframe(results_df, use_container_width=True)
+
+    with tab2:
+        st.dataframe(best_by_dataset, use_container_width=True)
+
+    with tab3:
+        st.dataframe(best_overall, use_container_width=True)
+
+    with tab4:
+        st.dataframe(summary_by_model, use_container_width=True)
+        st.bar_chart(summary_by_model.set_index("model")[["f1_score", "auc", "mcc"]])
+
+    with tab5:
+        st.dataframe(summary_by_fs, use_container_width=True)
+        st.bar_chart(summary_by_fs.set_index("feature_selection")[["f1_score", "auc", "mcc"]])
+
+    with tab6:
+        if summary_by_k.empty:
+            st.info("Summary K tidak tersedia.")
+        else:
+            st.dataframe(summary_by_k, use_container_width=True)
+            st.bar_chart(summary_by_k.set_index("k_requested")[["f1_score", "auc", "mcc"]])
+
+    with tab7:
+        st.dataframe(summary_by_combination, use_container_width=True)
+
+    with tab8:
+        st.dataframe(selected_features_df, use_container_width=True)
+
+    # =========================================================
+    # DOWNLOAD EXCEL
+    # =========================================================
+
+    excel_file = create_excel_file(
+        dataset_summary_df=dataset_summary_df,
+        results_df=results_df,
+        best_by_dataset=best_by_dataset,
+        best_overall=best_overall,
+        summary_by_model=summary_by_model,
+        summary_by_fs=summary_by_fs,
+        summary_by_k=summary_by_k,
+        summary_by_combination=summary_by_combination,
+        selected_features_df=selected_features_df,
+    )
+
+    st.download_button(
+        label="⬇️ Download Hasil Eksperimen Excel",
+        data=excel_file,
+        file_name="hasil_eksperimen_sdp.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
